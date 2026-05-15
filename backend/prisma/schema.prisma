@@ -1,0 +1,438 @@
+// CIRCLE CCTP TRANSFER TRACKING SCHEMA
+// Complete database structure for cross-chain workflows
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TransferStatus {
+  DEPOSIT_DETECTED
+  VAULT_TO_BRIDGE_TRANSFER_INITIATED
+  VAULT_TO_BRIDGE_TRANSFER_CONFIRMED
+  APPROVAL_PENDING
+  APPROVAL_CONFIRMED
+  BURN_PENDING
+  BURN_CONFIRMED
+  MESSAGE_EXTRACTED
+  ATTESTATION_PENDING
+  ATTESTATION_RECEIVED
+  MINT_PENDING
+  MINT_CONFIRMED
+  TRANSFER_COMPLETED
+  TRANSFER_FAILED
+  CANCELLED
+}
+
+enum UserPositionStatus {
+  PENDING_MINT
+  ACTIVE
+  YIELD_ACTIVE
+  WITHDRAW_REQUESTED
+  WITHDRAWING
+  EXITED
+  FAILED
+}
+
+enum GizaAgentStatus {
+  UNKNOWN
+  CREATED
+  ACTIVATING
+  ACTIVE
+  RUNNING
+  DEACTIVATING
+  DEACTIVATED
+  FAILED
+}
+
+enum WithdrawalRequestStatus {
+  REQUESTED
+  GIZA_EXIT_PENDING
+  GIZA_EXIT_COMPLETED
+  BURN_PENDING
+  ATTESTATION_PENDING
+  MINT_PENDING
+  COMPLETED
+  FAILED
+}
+
+enum WithdrawalType {
+  PARTIAL
+  FULL
+}
+
+enum ReverseCctpStatus {
+  BURN_PENDING
+  BURN_CONFIRMED
+  MESSAGE_EXTRACTED
+  ATTESTATION_PENDING
+  ATTESTATION_RECEIVED
+  MINT_PENDING
+  MINT_CONFIRMED
+  COMPLETED
+  FAILED
+}
+
+model Deposit {
+  id String @id @default(cuid())
+
+  walletAddress String @db.VarChar(42)
+  userAddress String
+  userAddressLower String
+
+  amount BigInt
+  depositedAt DateTime
+
+  positionId String?
+  position UserPosition? @relation(fields: [positionId], references: [id])
+
+  txHash String @unique @db.VarChar(66)
+  blockNumber BigInt
+  logIndex Int
+  eventSignature String @unique
+
+  isProcessed Boolean @default(false)
+  processedAt DateTime?
+
+  crossChainTransfer CrossChainTransfer?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([walletAddress])
+  @@index([blockNumber])
+  @@index([createdAt])
+  @@index([userAddressLower])
+  @@index([isProcessed])
+}
+
+model UserPosition {
+  id String @id @default(cuid())
+
+  walletAddress String @db.VarChar(42)
+  walletAddressLower String @unique @db.VarChar(42)
+
+  chain String @default("ARBITRUM")
+  status UserPositionStatus @default(PENDING_MINT)
+
+  principal BigInt @default(0)
+  currentValue BigInt @default(0)
+  yieldEarned BigInt @default(0)
+  apy Float?
+
+  depositCount Int @default(0)
+  lastSyncedAt DateTime?
+
+  deposits Deposit[]
+  gizaPosition GizaPosition?
+  snapshots PortfolioSnapshot[]
+  yieldHistory YieldHistory[]
+  withdrawalRequests WithdrawalRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([chain])
+  @@index([createdAt])
+}
+
+model GizaPosition {
+  id String @id @default(cuid())
+
+  userPositionId String @unique
+  userPosition UserPosition @relation(fields: [userPositionId], references: [id])
+
+  ownerAddress String @db.VarChar(42)
+  ownerAddressLower String @db.VarChar(42)
+  smartAccountAddress String @unique @db.VarChar(42)
+  smartAccountAddressLower String @unique @db.VarChar(42)
+
+  chain String @default("ARBITRUM")
+  tokenAddress String @db.VarChar(42)
+  status GizaAgentStatus @default(CREATED)
+
+  protocols Json?
+  constraints Json?
+  metadata Json?
+
+  activationTxHash String? @db.VarChar(66)
+  topUpTxHash String? @db.VarChar(66)
+  runTxHash String? @db.VarChar(66)
+  deactivationTxHash String? @db.VarChar(66)
+
+  lastSyncedAt DateTime?
+
+  snapshots PortfolioSnapshot[]
+  yieldHistory YieldHistory[]
+  withdrawalRequests WithdrawalRequest[]
+  reverseTransfers ReverseCctpTransfer[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([chain])
+  @@index([ownerAddressLower])
+}
+
+model PortfolioSnapshot {
+  id String @id @default(cuid())
+
+  userPositionId String
+  userPosition UserPosition @relation(fields: [userPositionId], references: [id])
+
+  gizaPositionId String?
+  gizaPosition GizaPosition? @relation(fields: [gizaPositionId], references: [id])
+
+  principal BigInt
+  currentValue BigInt
+  yieldEarned BigInt
+  apr Float?
+  allocations Json?
+  source String @default("giza")
+
+  capturedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  yieldHistory YieldHistory[]
+
+  @@index([userPositionId])
+  @@index([gizaPositionId])
+  @@index([capturedAt])
+}
+
+model YieldHistory {
+  id String @id @default(cuid())
+
+  userPositionId String
+  userPosition UserPosition @relation(fields: [userPositionId], references: [id])
+
+  gizaPositionId String?
+  gizaPosition GizaPosition? @relation(fields: [gizaPositionId], references: [id])
+
+  portfolioSnapshotId String?
+  portfolioSnapshot PortfolioSnapshot? @relation(fields: [portfolioSnapshotId], references: [id])
+
+  principal BigInt
+  currentValue BigInt
+  yieldDelta BigInt
+  apy Float?
+  reason String @default("reconciliation")
+  metadata Json?
+
+  recordedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([userPositionId])
+  @@index([gizaPositionId])
+  @@index([recordedAt])
+}
+
+model WithdrawalRequest {
+  id String @id @default(cuid())
+
+  userPositionId String
+  userPosition UserPosition @relation(fields: [userPositionId], references: [id])
+
+  gizaPositionId String?
+  gizaPosition GizaPosition? @relation(fields: [gizaPositionId], references: [id])
+
+  reverseTransfer ReverseCctpTransfer?
+
+  amount BigInt?
+  withdrawalType WithdrawalType @default(FULL)
+  status WithdrawalRequestStatus @default(REQUESTED)
+
+  requestedBy String @db.VarChar(42)
+  requestedAt DateTime @default(now())
+  exitRequestedAt DateTime?
+  exitCompletedAt DateTime?
+  completedAt DateTime?
+  failureReason String?
+  metadata Json?
+
+  gizaExitTxHash String? @db.VarChar(66)
+  gizaExitConfirmedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([requestedBy])
+  @@index([requestedAt])
+}
+
+model ReverseCctpTransfer {
+  id String @id @default(cuid())
+
+  withdrawalRequestId String @unique
+  withdrawalRequest WithdrawalRequest @relation(fields: [withdrawalRequestId], references: [id])
+
+  gizaPositionId String?
+  gizaPosition GizaPosition? @relation(fields: [gizaPositionId], references: [id])
+
+  sourceChain String @default("ARBITRUM")
+  destinationChain String @default("XDC")
+  recipientAddressXdc String @db.VarChar(42)
+  recipientAddressXdcLower String @db.VarChar(42)
+
+  amount BigInt
+  status ReverseCctpStatus @default(BURN_PENDING)
+
+  burnTxHash String? @unique @db.VarChar(66)
+  burnBlockNumber Int?
+  burnConfirmedAt DateTime?
+
+  messageBytes String?
+  messageHash String? @unique @db.VarChar(66)
+  attestation String?
+  attestationReceivedAt DateTime?
+
+  mintTxHash String? @unique @db.VarChar(66)
+  mintBlockNumber Int?
+  mintConfirmedAt DateTime?
+
+  errorMessage String?
+  attempts Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([messageHash])
+  @@index([recipientAddressXdcLower])
+  @@index([gizaPositionId])
+}
+
+model CrossChainTransfer {
+  id String @id @default(cuid())
+
+  depositId String @unique
+  deposit Deposit @relation(fields: [depositId], references: [id])
+
+  recipientAddressArb String
+  recipientAddressArbLower String
+
+  amount String
+
+  bridgeWalletAddress String? @db.VarChar(42)
+
+  status TransferStatus @default(DEPOSIT_DETECTED)
+  statusUpdatedAt DateTime @default(now())
+
+  vaultToBridgeTxHash String? @db.VarChar(66)
+  vaultToBridgeBlockNumber Int?
+  vaultToBridgeInitiatedAt DateTime?
+  vaultToBridgeConfirmedAt DateTime?
+  bridgeWalletPreBalance String?
+  bridgeWalletPostBalance String?
+  bridgeTransferError String?
+  bridgeTransferAttempts Int @default(0)
+
+  xdcBurnTxHash String?
+  xdcBurnBlockNumber Int?
+  xdcBurnConfirmedAt DateTime?
+  burnError String?
+  burnAttempts Int @default(0)
+
+  messageBytes String?
+  messageHash String? @unique
+  messageBurnToken String?
+
+  attestationStatus String?
+  attestation String?
+  attestationReceivedAt DateTime?
+  attestationPollAttempts Int @default(0)
+  attestationError String?
+
+  arbMintTxHash String?
+  arbMintBlockNumber Int?
+  arbMintConfirmedAt DateTime?
+  mintError String?
+  mintAttempts Int @default(0)
+
+  completedAt DateTime?
+  failureReason String?
+
+  logs TransferLog[]
+  cctpBurn CctpBurn?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([recipientAddressArbLower])
+  @@index([status])
+  @@index([messageHash])
+  @@index([createdAt])
+  @@index([statusUpdatedAt])
+}
+
+model CctpBurn {
+  id String @id @default(cuid())
+
+  transferId String @unique
+  transfer CrossChainTransfer @relation(fields: [transferId], references: [id])
+
+  sourceChain String @default("XDC")
+  destinationChain String @default("ARBITRUM")
+  destinationDomain Int
+
+  burnTokenAddress String @db.VarChar(42)
+  tokenMessengerAddress String @db.VarChar(42)
+  bridgeWalletAddress String @db.VarChar(42)
+
+  amount String
+
+  approvalTxHash String? @db.VarChar(66)
+  approvalConfirmedAt DateTime?
+
+  burnTxHash String? @unique @db.VarChar(66)
+  burnBlockNumber Int?
+  burnConfirmedAt DateTime?
+
+  messageBytes String?
+  messageHash String? @unique @db.VarChar(66)
+  messageExtractedAt DateTime?
+
+  bridgeWalletPreBurnBalance String?
+  bridgeWalletPostBurnBalance String?
+
+  status TransferStatus @default(BURN_PENDING)
+  errorMessage String?
+  attempts Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([messageHash])
+}
+
+model TransferLog {
+  id String @id @default(cuid())
+
+  transferId String
+  transfer CrossChainTransfer @relation(fields: [transferId], references: [id])
+
+  phase String
+  action String
+  status String
+  message String
+
+  metadata Json?
+  errorCode String?
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+
+  @@index([transferId])
+  @@index([status])
+  @@index([phase])
+  @@index([createdAt])
+}

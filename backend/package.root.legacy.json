@@ -1,0 +1,21 @@
+{
+  "name": "nn-project",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "compile": "npx hardhat compile",
+    "deploy": "npx hardhat run scripts/deploy.js --network xdcTestnet"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^3.0.0",
+    "hardhat": "^2.18.0",
+    "ethers": "^6.8.0",
+    "dotenv": "^16.0.0",
+    "@openzeppelin/contracts": "^4.9.0"
+  }
+}
