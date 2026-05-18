@@ -43,6 +43,22 @@ interface MintResult {
   recipientFinalBalance: string;
 }
 
+/**
+ * Result of gas balance check before mint execution
+ */
+interface GasBalanceCheckResult {
+  success: boolean;
+  error?: {
+    code: string;
+    message: string;
+    signer: string;
+    balance: string;
+    required: string;
+    gasPrice: string;
+    estimatedGas: string;
+  };
+}
+
 @Injectable()
 export class CctpMintService {
   private readonly logger = new Logger(CctpMintService.name);
@@ -54,14 +70,156 @@ export class CctpMintService {
   ) {}
 
   /**
+   * Pre-flight gas balance check for mint execution
+   *
+   * WHY NEEDED:
+   * Mint transactions need ETH for gas on Arbitrum
+   * If signer wallet has insufficient ETH, receiveMessage() will fail
+   * This check fails early and returns actionable error
+   * Preserves MINT_PENDING state so workflow can resume after funding
+   *
+   * FLOW:
+   * 1. Estimate gas needed for receiveMessage()
+   * 2. Get current gas price on Arbitrum
+   * 3. Get signer's current ETH balance
+   * 4. Calculate required balance = estimatedGas × gasPrice × 2 (safety multiplier)
+   * 5. Compare current balance vs required balance
+   * 6. Return result with detailed diagnostics
+   *
+   * SAFETY MULTIPLIER:
+   * Uses 2x estimated gas to account for:
+   * - Gas price fluctuations between check and execution
+   * - Unexpected gas usage increases
+   * - Provides buffer for retry scenarios
+   *
+   * @param messageBytes Message bytes for receiveMessage()
+   * @param attestation Attestation proof for receiveMessage()
+   * @returns Result with success flag and optional error details
+   */
+  async ensureMintGasBalance(
+    messageBytes: string,
+    attestation: string,
+  ): Promise<GasBalanceCheckResult> {
+    try {
+      const arbProvider = this.providerService.getArbProvider();
+      const arbSigner = this.signerService.getArbSigner();
+      const signerAddress = arbSigner.address;
+      const arbRpcUrl = process.env.ARB_RPC_URL || 'Unknown';
+
+      this.logger.log('[Mint] Starting pre-flight gas balance check', {
+        signerAddress,
+        chain: 'Arbitrum',
+        rpcUrl: arbRpcUrl,
+      });
+
+      // Step 1: Estimate gas for receiveMessage
+      let estimatedGas: string;
+      try {
+        estimatedGas = await this.estimateReceiveMessageGas(messageBytes, attestation);
+      } catch (error) {
+        // If gas estimation fails, this is a validation error, not a balance issue
+        throw new Error(
+          `Cannot proceed with mint - gas estimation failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      this.logger.debug('[Mint] Gas estimation for receiveMessage', {
+        estimatedGasUnits: estimatedGas,
+      });
+
+      // Step 2: Get current gas price on Arbitrum
+      const gasPrice = await arbProvider.getFeeData();
+      if (!gasPrice?.gasPrice) {
+        throw new Error('Could not fetch gas price from provider');
+      }
+      const gasPriceGwei = ethers.formatUnits(gasPrice.gasPrice, 'gwei');
+      const gasPriceEth = ethers.formatUnits(gasPrice.gasPrice, 18);
+
+      this.logger.debug('[Mint] Current Arbitrum gas price', {
+        gasPriceWei: gasPrice.gasPrice.toString(),
+        gasPriceGwei,
+        gasPriceEth,
+      });
+
+      // Step 3: Get current signer ETH balance
+      const currentBalance = await arbProvider.getBalance(signerAddress);
+      const currentBalanceEth = ethers.formatUnits(currentBalance, 18);
+
+      this.logger.debug('[Mint] Signer current ETH balance', {
+        currentBalanceWei: currentBalance.toString(),
+        currentBalanceEth,
+      });
+
+      // Step 4: Calculate required balance with 2x safety multiplier
+      const estimatedGasBigInt = BigInt(estimatedGas);
+      const gasPriceBigInt = gasPrice.gasPrice;
+      const multiplier = 2n;
+      const requiredBalance = estimatedGasBigInt * gasPriceBigInt * multiplier;
+      const requiredBalanceEth = ethers.formatUnits(requiredBalance, 18);
+
+      this.logger.log('[Mint] Gas balance check calculation', {
+        estimatedGasUnits: estimatedGas,
+        gasPriceWei: gasPrice.gasPrice.toString(),
+        safetyMultiplier: multiplier.toString(),
+        requiredBalanceWei: requiredBalance.toString(),
+        requiredBalanceEth,
+      });
+
+      // Step 5: Validate balance
+      if (currentBalance >= requiredBalance) {
+        this.logger.log('[Mint] Gas balance sufficient for mint execution', {
+          currentBalanceEth,
+          requiredBalanceEth,
+          buffer: ethers.formatUnits(currentBalance - requiredBalance, 18),
+        });
+        return { success: true };
+      }
+
+      // Balance insufficient
+      const deficit = requiredBalance - currentBalance;
+      const deficitEth = ethers.formatUnits(deficit, 18);
+
+      this.logger.error('[Mint] INSUFFICIENT_GAS_BALANCE detected', {
+        signerAddress,
+        currentBalanceEth,
+        requiredBalanceEth,
+        deficitEth,
+        gasPrice: gasPrice.toString(),
+        estimatedGas,
+        recommendation: `Fund signer wallet with at least ${deficitEth} ETH to complete mint transaction`,
+      });
+
+      return {
+        success: false,
+        error: {
+          code: 'INSUFFICIENT_GAS_BALANCE',
+          message: `Signer wallet has insufficient ETH for gas. Current: ${currentBalanceEth} ETH, Required: ${requiredBalanceEth} ETH, Deficit: ${deficitEth} ETH`,
+          signer: signerAddress,
+          balance: currentBalance.toString(),
+          required: requiredBalance.toString(),
+          gasPrice: gasPrice.gasPrice.toString(),
+          estimatedGas,
+        },
+      };
+    } catch (error) {
+      this.logger.error('[Mint] Gas balance check failed with error', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Execute complete mint flow
    * 
    * FLOW:
    * 1. Validate inputs
    * 2. Get MessageTransmitter contract
-   * 3. Call receiveMessage() with proof
-   * 4. Wait for confirmation
-   * 5. Verify USDC balance increased
+   * 3. Get initial USDC balance
+   * 4. Pre-flight gas balance check (ensures signer has sufficient ETH for gas)
+   * 5. Call receiveMessage() with proof
+   * 6. Wait for confirmation
+   * 7. Verify USDC balance increased
    * 
    * CRITICAL: Message and attestation must match the burn
    * If data doesn't match, MessageTransmitter rejects it
@@ -96,7 +254,21 @@ export class CctpMintService {
         `[Mint] Recipient initial USDC balance: ${initialBalance.toString()}`
       );
 
-      // Step 4: Call receiveMessage()
+      // Step 4: Pre-flight gas balance check
+      const balanceCheck = await this.ensureMintGasBalance(
+        messageBytes,
+        attestation,
+      );
+
+      if (!balanceCheck.success) {
+        // Return error cleanly - orchestrator will catch and transition to MINT_PENDING
+        this.logger.error('[Mint] Mint aborted - gas balance check failed', balanceCheck.error);
+        throw new Error(
+          balanceCheck.error?.message || 'Insufficient ETH balance for mint gas'
+        );
+      }
+
+      // Step 6: Call receiveMessage()
       this.logger.log(
         `[Mint] Executing receiveMessage() on Arbitrum...`
       );
@@ -110,7 +282,7 @@ export class CctpMintService {
         `[Mint] Transaction submitted. Hash: ${tx.hash}`
       );
 
-      // Step 5: Wait for confirmation
+      // Step 7: Wait for confirmation
       const confirmations = Number.parseInt(process.env.ARB_CONFIRMATIONS_REQUIRED || '6', 10);
       const receipt = await tx.wait(confirmations);
 
@@ -122,7 +294,7 @@ export class CctpMintService {
         `[Mint] Transaction confirmed. Block: ${receipt.blockNumber}, Gas used: ${receipt.gasUsed}`
       );
 
-      // Step 6: Verify USDC balance increased
+      // Step 8: Verify USDC balance increased
       const finalBalance = await usdc.balanceOf(recipientAddress);
       const mintedAmount = (BigInt(finalBalance) - BigInt(initialBalance)).toString();
 

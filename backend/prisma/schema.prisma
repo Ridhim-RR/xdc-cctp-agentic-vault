@@ -49,6 +49,14 @@ enum GizaAgentStatus {
   FAILED
 }
 
+enum AgentPositionStatus {
+  CREATED
+  ACTIVATING
+  ACTIVE
+  SYNCED
+  FAILED
+}
+
 enum WithdrawalRequestStatus {
   REQUESTED
   GIZA_EXIT_PENDING
@@ -361,6 +369,7 @@ model CrossChainTransfer {
 
   logs TransferLog[]
   cctpBurn CctpBurn?
+  agentPosition AgentPosition?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -370,6 +379,34 @@ model CrossChainTransfer {
   @@index([messageHash])
   @@index([createdAt])
   @@index([statusUpdatedAt])
+}
+
+model AgentPosition {
+  id String @id @default(cuid())
+
+  userId String
+
+  transferId String @unique
+  transfer CrossChainTransfer @relation(fields: [transferId], references: [id])
+
+  gizaAgentId String
+  principalAmount String
+  currentPortfolioValue String @default("0")
+
+  status AgentPositionStatus @default(CREATED)
+  sourceChain String @default("XDC")
+  destinationChain String @default("ARBITRUM")
+
+  metadata Json?
+  lastSyncedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([gizaAgentId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 model CctpBurn {

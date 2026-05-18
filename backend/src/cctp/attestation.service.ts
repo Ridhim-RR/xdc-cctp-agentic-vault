@@ -34,6 +34,7 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
+import { ethers } from 'ethers';
 
 /**
  * Circle IRIS API response structure
@@ -45,13 +46,48 @@ interface IrisAttestationResponse {
   errorMessage?: string;
 }
 
+interface IrisV2AttestationResponse {
+  status: string;
+  message?: string;
+  attestation?: string;
+  eventNonce?: string | number;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+interface IrisV2MessagesEnvelope {
+  messages?: Array<{
+    status?: string;
+    message?: string;
+    attestation?: string;
+    eventNonce?: string | number;
+    errorCode?: string;
+    errorMessage?: string;
+  }>;
+}
+
+interface AttestationPollOptions {
+  burnTxHash?: string;
+  sourceDomainId?: number;
+  messageBytes?: string;
+}
+
+interface DecodedCanonicalMessage {
+  sourceDomain: number;
+  destinationDomain: number;
+  nonce: string;
+  sender: string;
+}
+
 /**
  * Attestation polling result
  */
 interface AttestationResult {
   messageHash: string;
+  message?: string;
   attestation: string;
   status: string;
+  eventNonce?: string | number;
   attempts: number;
   totalTimeSeconds: number;
 }
@@ -252,9 +288,35 @@ export class CircleIrisAttestationService {
   async pollForAttestation(
     messageHash: string,
     maxAttempts: number = 100,
+    options?: AttestationPollOptions,
   ): Promise<AttestationResult> {
     if (!messageHash.startsWith('0x')) {
       throw new Error('Invalid message hash format. Must start with 0x');
+    }
+
+    const sourceDomainId = options?.sourceDomainId ?? 18;
+
+    if (options?.messageBytes) {
+      const decodedMessage = this.decodeCanonicalMessage(options.messageBytes);
+      this.logger.log(
+        `[Canonical Message] sourceDomain=${decodedMessage.sourceDomain}, destinationDomain=${decodedMessage.destinationDomain}, nonce=${decodedMessage.nonce}, sender=${decodedMessage.sender}`
+      );
+    }
+
+    if (options?.burnTxHash) {
+      try {
+        return await this.pollForAttestationByTransactionHash(
+          options.burnTxHash,
+          sourceDomainId,
+          messageHash,
+          maxAttempts,
+          options.messageBytes,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `[Attestation] V2 lookup failed, falling back to legacy messageHash polling: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
 
     const startTime = Date.now();
@@ -278,8 +340,10 @@ export class CircleIrisAttestationService {
 
           return {
             messageHash,
+            message: undefined,
             attestation: response.attestation || '',
             status: 'attested',
+            eventNonce: undefined,
             attempts: attempt,
             totalTimeSeconds: totalTime,
           };
@@ -415,6 +479,215 @@ export class CircleIrisAttestationService {
         `Circle IRIS API error: ${error.message || 'Unknown error'}`
       );
     }
+  }
+
+  private async pollForAttestationByTransactionHash(
+    burnTxHash: string,
+    sourceDomainId: number,
+    messageHash: string,
+    maxAttempts: number,
+    canonicalMessageBytes?: string,
+  ): Promise<AttestationResult> {
+    if (!burnTxHash.startsWith('0x')) {
+      throw new Error('Invalid burn transaction hash format. Must start with 0x');
+    }
+
+    const startTime = Date.now();
+    let lastError: Error | null = null;
+
+    this.logger.log(
+      `[Attestation][V2] Starting poll for txHash=${burnTxHash}, sourceDomainId=${sourceDomainId}, messageHash=${messageHash}`
+    );
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await this.queryAttestationV2(burnTxHash, sourceDomainId);
+
+        const isComplete = response.status === 'complete';
+        const hasAttestation = Boolean(response.attestation);
+        const hasMessage = Boolean(response.message);
+
+        this.logger.log(`[Attestation][V2] parsed status=${response.status}`);
+        this.logger.log(`[Attestation][V2] attestation exists=${hasAttestation}`);
+        this.logger.log(`[Attestation][V2] message exists=${hasMessage}`);
+        this.logger.log(`[Attestation][V2] nonce=${response.eventNonce ?? 'n/a'}`);
+        this.logger.log(
+          `[Attestation][V2] full parsed object=${JSON.stringify(response, (_key, value) => typeof value === 'bigint' ? value.toString() : value)}`
+        );
+
+        if (isComplete && hasAttestation && hasMessage) {
+          const message = response.message;
+          if (!message) {
+            throw new Error('Circle V2 attestation returned no message payload');
+          }
+
+          if (!response.attestation) {
+            throw new Error('Circle V2 attestation returned no attestation payload');
+          }
+
+          this.logger.log(`[Attestation][V2] IRIS message length=${message.length}`);
+          this.logger.log(
+            `[Attestation][V2] local canonical message length=${canonicalMessageBytes ? canonicalMessageBytes.length : 'n/a'}`
+          );
+          this.logger.log('[Attestation][V2] comparison skipped=true');
+
+          const totalTime = (Date.now() - startTime) / 1000;
+          this.logger.log(
+            `[Attestation][V2] ✅ Received attestation after ${attempt} attempts (${totalTime.toFixed(1)}s)`
+          );
+
+          return {
+            messageHash,
+            message,
+            attestation: response.attestation,
+            status: response.status,
+            eventNonce: response.eventNonce,
+            attempts: attempt,
+            totalTimeSeconds: totalTime,
+          };
+        }
+
+        if (response.status === 'failed') {
+          throw new Error(
+            `Circle V2 attestation failed: ${response.errorMessage || 'Unknown error'}`
+          );
+        }
+
+        this.logger.debug(
+          `[Attestation][V2] Attempt ${attempt}/${maxAttempts}: Status still pending. Waiting before retry...`
+        );
+
+        const delay = this.calculateBackoffDelay(attempt);
+        await this.sleep(delay);
+      } catch (error) {
+        lastError = error as Error;
+
+        if (this.isPermanentError(error)) {
+          this.logger.error(
+            `[Attestation][V2] Permanent error at attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`
+          );
+          throw error;
+        }
+
+        this.logger.warn(
+          `[Attestation][V2] Attempt ${attempt} failed (temporary): ${error instanceof Error ? error.message : String(error)}. Retrying...`
+        );
+
+        const delay = this.calculateBackoffDelay(attempt);
+        await this.sleep(delay);
+      }
+    }
+
+    const totalTime = (Date.now() - startTime) / 1000;
+    const errorMsg = lastError
+      ? `Last error: ${lastError.message}`
+      : 'No attestation received';
+
+    this.logger.error(
+      `[Attestation][V2] ❌ Max attempts (${maxAttempts}) exhausted after ${totalTime.toFixed(1)}s. ${errorMsg}`
+    );
+
+    throw new Error(
+      `V2 attestation polling timeout after ${maxAttempts} attempts (${totalTime.toFixed(1)}s). ${errorMsg}`
+    );
+  }
+
+  private async queryAttestationV2(
+    burnTxHash: string,
+    sourceDomainId: number,
+  ): Promise<IrisV2AttestationResponse> {
+    try {
+      const client = this.getIrisClient();
+      const endpoint = `/v2/messages/${sourceDomainId}`;
+      const requestUrl = `${client.defaults.baseURL || ''}${endpoint}?transactionHash=${encodeURIComponent(burnTxHash)}`;
+
+      this.logger.log(`[Iris][V2] requestUrl=${requestUrl}`);
+      this.logger.log(`[Iris][V2] txHash=${burnTxHash}`);
+      this.logger.log(`[Iris][V2] sourceDomainId=${sourceDomainId}`);
+
+      const response = await client.get<IrisV2AttestationResponse>(endpoint, {
+        params: {
+          transactionHash: burnTxHash,
+        },
+      });
+
+      const irisResponse = response.data as unknown as IrisV2MessagesEnvelope;
+      const irisMessage = irisResponse?.messages?.[0];
+      const parsedResponse: IrisV2AttestationResponse = {
+        status: irisMessage?.status || 'pending',
+        attestation: irisMessage?.attestation,
+        message: irisMessage?.message,
+        eventNonce: irisMessage?.eventNonce,
+        errorCode: irisMessage?.errorCode,
+        errorMessage: irisMessage?.errorMessage,
+      };
+
+      this.logger.log(
+        `[Iris][V2] IRIS response body=${JSON.stringify(response.data, (_key, value) => typeof value === 'bigint' ? value.toString() : value)}`
+      );
+      this.logger.log(`[Iris][V2] parsed status=${parsedResponse.status}`);
+      this.logger.log(`[Iris][V2] attestation exists=${Boolean(parsedResponse.attestation)}`);
+      this.logger.log(`[Iris][V2] message exists=${Boolean(parsedResponse.message)}`);
+      this.logger.log(`[Iris][V2] nonce=${parsedResponse.eventNonce ?? 'n/a'}`);
+      this.logger.log(
+        `[Iris][V2] full parsed object=${JSON.stringify(parsedResponse, (_key, value) => typeof value === 'bigint' ? value.toString() : value)}`
+      );
+
+      return parsedResponse;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        this.logger.debug(
+          `[Iris][V2] 404: Message not found yet on Circle (expected during early polling)`
+        );
+        return { status: 'pending' };
+      }
+
+      if (error.response?.status === 503) {
+        throw new Error('Circle IRIS V2 API temporarily unavailable (503)');
+      }
+
+      if (error.code === 'ECONNABORTED') {
+        throw new Error('Circle IRIS V2 API request timeout (10s)');
+      }
+
+      if (error.message?.includes('Network Error') || error.message?.includes('ENOTFOUND')) {
+        throw new Error(
+          `Network error connecting to Circle IRIS V2 API: ${error.message}`
+        );
+      }
+
+      this.logger.error(
+        `[Iris][V2] Unexpected error: ${error.message}`,
+        error.response?.data
+      );
+
+      throw new Error(
+        `Circle IRIS V2 API error: ${error.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  private decodeCanonicalMessage(messageBytes: string): DecodedCanonicalMessage {
+    if (!messageBytes.startsWith('0x')) {
+      throw new Error('Canonical message must be hex string starting with 0x');
+    }
+
+    const bytes = ethers.getBytes(messageBytes);
+    if (bytes.length < 52) {
+      throw new Error(`Canonical message too short to decode. Length: ${bytes.length}`);
+    }
+
+    const sourceDomain = Number(ethers.toBigInt(bytes.slice(4, 8)));
+    const destinationDomain = Number(ethers.toBigInt(bytes.slice(8, 12)));
+    const nonce = ethers.toBigInt(bytes.slice(12, 20)).toString();
+    const sender = ethers.hexlify(bytes.slice(20, 52));
+
+    return {
+      sourceDomain,
+      destinationDomain,
+      nonce,
+      sender,
+    };
   }
 
   /**

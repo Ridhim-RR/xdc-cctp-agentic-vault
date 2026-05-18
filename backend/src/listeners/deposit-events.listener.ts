@@ -44,8 +44,11 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
   // Polling interval (in milliseconds) for checking new blocks
   private readonly POLL_INTERVAL = 12000; // 12 seconds (average XDC block time)
 
+  // Short delay while catching up historical backlog
+  private readonly CATCH_UP_DELAY = 250;
+
   // How many blocks to process at a time
-  private readonly BLOCK_BATCH_SIZE = 100;
+  private readonly BLOCK_BATCH_SIZE = 1000;
 
   // Blocks to look back from current when starting fresh
   private readonly LOOKBACK_BLOCKS = 1000;
@@ -64,7 +67,7 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     try {
       console.log('[Listener] Initializing deposit events listener...');
-      await this.start();
+      void this.start();
     } catch (error) {
       console.error('[Listener] Failed to initialize:', error);
       // Don't throw; let the app start anyway
@@ -101,6 +104,8 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
     }
 
     console.log('[Listener] Connecting to XDC testnet...');
+    console.log(`[Listener] RPC URL: ${rpcUrl}`);
+    console.log(`[Listener] Vault address: ${vaultAddress}`);
     this.provider = getProvider(rpcUrl);
     this.vaultContract = getVaultContract(this.provider, vaultAddress);
 
@@ -114,7 +119,7 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
     this.isListening = true;
 
     // Start polling for new blocks
-    await this.pollForNewEvents();
+    void this.pollForNewEvents();
   }
 
   /**
@@ -124,23 +129,22 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
   private async pollForNewEvents() {
     while (this.isListening) {
       try {
-        await this.processNewEvents();
+        const caughtUp = await this.processNewEvents();
+        await this.sleep(caughtUp ? this.POLL_INTERVAL : this.CATCH_UP_DELAY);
       } catch (error) {
         console.error('[Listener] Error processing events:', error);
         // Don't crash; wait and retry
+        await this.sleep(this.POLL_INTERVAL);
       }
-
-      // Wait before checking again
-      await this.sleep(this.POLL_INTERVAL);
     }
   }
 
   /**
    * Check for new Deposited events and store them.
    */
-  private async processNewEvents() {
+  private async processNewEvents(): Promise<boolean> {
     if (!this.provider || !this.vaultContract) {
-      return;
+      return true;
     }
 
     try {
@@ -148,7 +152,7 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
 
       const blockWindow = this.getBlockWindow(currentBlock);
       if (!blockWindow) {
-        return;
+        return true;
       }
       const { fromBlock, toBlock } = blockWindow;
 
@@ -177,8 +181,10 @@ export class DepositEventsListener implements OnModuleInit, OnModuleDestroy {
 
       // Update last processed block
       this.lastProcessedBlock = BigInt(toBlock);
+      return toBlock >= currentBlock;
     } catch (error) {
       console.error('[Listener] Error in processNewEvents:', error);
+      return true;
     }
   }
 

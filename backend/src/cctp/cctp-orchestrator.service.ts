@@ -34,6 +34,7 @@ import { CircleIrisAttestationService } from './attestation.service';
 import { CctpMintService } from './mint.service';
 import { TransferStateService } from '../transfers/transfer-state.service';
 import { BlockchainSignerService } from '../blockchain/signer.service';
+import { GizaAgentService } from '../giza/giza-agent.service';
 
 /**
  * Complete CCTP operation result
@@ -60,12 +61,14 @@ interface BurnPhaseData {
 }
 
 interface AttestationPhaseData {
+  message: string;
   attestation: string;
 }
 
 interface MintPhaseData {
   txHash: string;
   blockNumber: number;
+  mintedAmount: string;
 }
 
 @Injectable()
@@ -78,6 +81,7 @@ export class CctpOrchestratorService {
     private readonly mintService: CctpMintService,
     private readonly transferStateService: TransferStateService,
     private readonly signerService: BlockchainSignerService,
+    private readonly gizaAgentService: GizaAgentService,
   ) {}
 
   async executeBurnOnly(
@@ -230,6 +234,7 @@ export class CctpOrchestratorService {
         transferId,
         burnPhase.data.messageHash,
         burnPhase.data.txHash,
+        burnPhase.data.messageBytes,
         startTime,
       );
       if (!attestationPhase.success) {
@@ -333,6 +338,7 @@ export class CctpOrchestratorService {
     transferId: string,
     messageHash: string,
     burnTxHash: string,
+    messageBytes: string,
     startTime: number,
   ): Promise<{ success: true; data: AttestationPhaseData } | { success: false; result: CctpOperationResult }> {
     try {
@@ -341,6 +347,11 @@ export class CctpOrchestratorService {
       const attestationResult = await this.attestationService.pollForAttestation(
         messageHash,
         Number.parseInt(process.env.ATTESTATION_MAX_RETRIES || '100', 10),
+        {
+          burnTxHash,
+          sourceDomainId: Number.parseInt(process.env.XDC_SOURCE_DOMAIN_ID || '18', 10),
+          messageBytes,
+        },
       );
 
       this.logger.log(
@@ -352,9 +363,14 @@ export class CctpOrchestratorService {
         attestationResult.attestation,
       );
 
+      if (!attestationResult.message) {
+        throw new Error('Attestation result missing IRIS message payload');
+      }
+
       return {
         success: true,
         data: {
+          message: attestationResult.message,
           attestation: attestationResult.attestation,
         },
       };
@@ -389,9 +405,11 @@ export class CctpOrchestratorService {
   ): Promise<{ success: true; data: MintPhaseData } | { success: false; result: CctpOperationResult }> {
     try {
       this.logger.log('[CCTP] Phase 3: MINT - Minting USDC on Arbitrum');
+      this.logger.log(`[CCTP] Phase 3: mint message length=${attestation.message.length}`);
+      this.logger.log(`[CCTP] Phase 3: mint message payload=${attestation.message}`);
 
       const mintResult = await this.mintService.executeMint(
-        burn.messageBytes,
+        attestation.message,
         attestation.attestation,
         recipientAddress,
         amount,
@@ -407,11 +425,19 @@ export class CctpOrchestratorService {
         mintResult.blockNumber,
       );
 
+      await this.initializeGizaPosition({
+        transferId,
+        mintedAmount: mintResult.mintedAmount,
+        mintTxHash: mintResult.txHash,
+        recipientAddress,
+      });
+
       return {
         success: true,
         data: {
           txHash: mintResult.txHash,
           blockNumber: mintResult.blockNumber,
+          mintedAmount: mintResult.mintedAmount,
         },
       };
     } catch (error) {
@@ -490,6 +516,13 @@ export class CctpOrchestratorService {
           0, // Block number unknown
         );
 
+        await this.initializeGizaPosition({
+          transferId,
+          mintedAmount: expectedAmount,
+          mintTxHash: messageHash,
+          recipientAddress,
+        });
+
         return { success: true };
       }
 
@@ -507,6 +540,13 @@ export class CctpOrchestratorService {
         mintResult.txHash,
         mintResult.blockNumber,
       );
+
+      await this.initializeGizaPosition({
+        transferId,
+        mintedAmount: mintResult.mintedAmount,
+        mintTxHash: mintResult.txHash,
+        recipientAddress,
+      });
 
       return { success: true, txHash: mintResult.txHash };
     } catch (error) {
@@ -576,5 +616,38 @@ export class CctpOrchestratorService {
   private calculateMessageHash(messageBytes: string): string {
     const { ethers } = require('ethers');
     return ethers.keccak256(messageBytes);
+  }
+
+  private async initializeGizaPosition(params: {
+    transferId: string;
+    mintedAmount: string;
+    mintTxHash: string;
+    recipientAddress: string;
+  }): Promise<void> {
+    try {
+      this.logger.log(`[Giza] initializeGizaPosition start for transfer ${params.transferId}`);
+
+      const result = await this.gizaAgentService.initializeGizaPosition({
+        transferId: params.transferId,
+        mintedAmount: params.mintedAmount,
+        mintTxHash: params.mintTxHash,
+        recipientAddress: params.recipientAddress,
+      });
+
+      this.logger.log(
+        `[Giza] initializeGizaPosition success for transfer ${params.transferId}. agent=${result.gizaAgentId}, value=${result.currentPortfolioValue}`,
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.error(`[Giza] initializeGizaPosition failed for transfer ${params.transferId}: ${reason}`);
+
+      try {
+        await this.gizaAgentService.markFailedInitialization(params.transferId, reason);
+      } catch (persistError) {
+        this.logger.error(
+          `[Giza] Failed to persist initialization error for transfer ${params.transferId}: ${persistError instanceof Error ? persistError.message : String(persistError)}`,
+        );
+      }
+    }
   }
 }
